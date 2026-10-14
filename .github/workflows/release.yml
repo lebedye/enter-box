@@ -1,0 +1,170 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Ручной запуск из вкладки Actions (полезно для тестов)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write   # нужно для создания Release
+
+jobs:
+  build:
+    name: Build ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Orange Pi (ARM64) — основная цель
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          # ARMv7 — старые Pi / некоторые Orange Pi
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+            suffix: linux-armv7
+          # ARMv6 — Raspberry Pi Zero и древние платы
+          - goos: linux
+            goarch: arm
+            goarm: '6'
+            suffix: linux-armv6
+          # x86_64 — для тестов на дев-машине
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VERSION"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          OUT="dist/enter-box-${{ matrix.suffix }}"
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${{ steps.ver.outputs.version }}" \
+            -o "$OUT" \
+            ./cmd/enter-box
+          ls -lh "$OUT"
+          file "$OUT"
+
+      - name: Build .tar.gz + .zip (с примером конфига)
+        run: |
+          set -euo pipefail
+          NAME="enter-box-${{ steps.ver.outputs.version }}-${{ matrix.suffix }}"
+          STAGE="dist/$NAME"
+
+          mkdir -p "$STAGE"
+          cp "dist/enter-box-${{ matrix.suffix }}" "$STAGE/enter-box"
+          cp enter-box.example.yaml                "$STAGE/enter-box.example.yaml"
+          cp deploy/systemd/enter-box.service      "$STAGE/enter-box.service"
+          cp deploy/nftables/enter-box.nft         "$STAGE/enter-box.nft" 2>/dev/null || true
+          cp README.md                             "$STAGE/README.md"      2>/dev/null || true
+          cp docs/USERDOC.md                       "$STAGE/USERDOC.md"     2>/dev/null || true
+          cp docs/SIMPLE-README.md                 "$STAGE/SIMPLE-README.md" 2>/dev/null || true
+
+          # tar.gz для Linux
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+
+          # sha256
+          (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+
+          rm -rf "$STAGE"
+          ls -lh dist/
+
+      - name: Upload artifacts (даже без релиза)
+        uses: actions/upload-artifact@v4
+        with:
+          name: enter-box-${{ matrix.suffix }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          retention-days: 14
+
+  # Отдельная job — собрать всё в один релиз
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files to publish
+        run: ls -lh dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: enter-box ${{ steps.ver.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.ver.outputs.version, '-rc') || contains(steps.ver.outputs.version, '-beta') }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          body: |
+            ## enter-box ${{ steps.ver.outputs.version }}
+
+            VPN-шлюз для Orange Pi и других Linux-устройств.
+            VLESS / VMess / AmneziaWG, RU → direct, всё остальное → VPN.
+
+            ### Установка
+
+            1. Скачайте архив под свою платформу ниже.
+            2. Распакуйте:
+               ```bash
+               tar xzf enter-box-*-linux-arm64.tar.gz
+               cd enter-box-*/
