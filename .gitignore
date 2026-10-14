@@ -1,0 +1,23 @@
+# Бинарники
+/dist/
+/enter-box
+/enter-box-arm64
+/enter-box.exe
+
+# Локальные конфиги (не коммитим!)
+/enter-box.yaml
+/*.local.yaml
+
+# Логи и временные файлы
+*.log
+*.pid
+*.tmp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

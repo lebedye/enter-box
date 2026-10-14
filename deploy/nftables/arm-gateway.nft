@@ -1,0 +1,14 @@
+# Справочная копия таблицы, которую enter-box накатывает сам.
+table inet enter_box {
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ct state established,related accept
+    iifname "eth0" oifname "usb0" accept
+    iifname "eth0" oifname "tun0" accept
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr 192.168.88.0/24 oifname "usb0" masquerade
+    ip saddr 192.168.88.0/24 oifname "tun0" masquerade
+  }
+}

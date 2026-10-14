@@ -1,0 +1,62 @@
+log:
+  level: info
+
+wan:
+  name: usb0
+
+lan:
+  interface: eth0
+  # Дополнительные LAN-интерфейсы (WiFi AP, второй USB-Ethernet).
+  # Должны быть в той же подсети, что и lan.address. Поднимаются
+  # автоматически (`ip link set up`), IP и DHCP для них общие.
+  extra_interfaces: []
+  address: 192.168.88.1/24
+  dhcp:
+    enabled: true
+    range_start: 192.168.88.100
+    range_end: 192.168.88.250
+    # Адреса, которые НЕ выдавать клиентам (для устройств со статикой).
+    # Формат: "192.168.88.5" или "192.168.88.60-192.168.88.65".
+    exclude: []
+    lease_time: 1h
+
+tun:
+  interface: tun0
+  address: 10.10.10.1/24
+  mtu: 1420
+  stack: system
+
+dns:
+  # Встроенный DNS-форвардер для клиентов. RU-домены → domestic,
+  # остальное → remote. Работает через те же правила sing-box,
+  # что и трафик: foreign-DNS уходит в VPN, domestic — напрямую.
+  serve: true
+  domestic: ["77.88.8.8", "77.88.8.1"]
+  remote:   ["1.1.1.1", "8.8.8.8"]
+
+endpoints:
+  - "vless://00000000-0000-0000-0000-000000000000@vps.example.com:443?type=tcp&security=reality&sni=www.cloudflare.com&pbk=PUBLIC_KEY&sid=ab&fp=chrome&flow=xtls-rprx-vision#my-vless"
+
+subscriptions:
+  # - url: https://provider.com/api/sub/TOKEN
+  #   tag: provider
+  #   user_agent: enter-box/1.0
+  #   auto_update: 6h
+
+routing:
+  use_ru_direct: true
+  domestic_domains:
+    - vk.com
+    - gosuslugi.ru
+    - sberbank.ru
+    - yandex.ru
+  domestic_suffix:
+    - .ru
+    - .рф
+  domestic_ip_cidr: []
+  force_proxy: []
+  urltest_interval: 3m
+  urltest_url: http://cp.cloudflare.com/generate_204
+  urltest_tolerance: 50
+  preferred: ""
+  final: proxy
