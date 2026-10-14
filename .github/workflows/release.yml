@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.goarch }}
+    name: Build ${{ matrix.suffix }}
     runs-on: ubuntu-latest
 
     strategy:
@@ -81,31 +81,32 @@ jobs:
           ls -lh "$OUT"
           file "$OUT"
 
-      - name: Build .tar.gz + .zip (с примером конфига)
+      - name: Package (.tar.gz + sha256)
         run: |
           set -euo pipefail
           NAME="enter-box-${{ steps.ver.outputs.version }}-${{ matrix.suffix }}"
           STAGE="dist/$NAME"
+          BIN="dist/enter-box-${{ matrix.suffix }}"
 
+          # Бинарь обязателен — если его нет, дальше нет смысла.
+          [ -f "$BIN" ] || { echo "binary $BIN not built"; exit 1; }
           mkdir -p "$STAGE"
-          cp "dist/enter-box-${{ matrix.suffix }}" "$STAGE/enter-box"
-          cp enter-box.example.yaml                "$STAGE/enter-box.example.yaml"
-          cp deploy/systemd/enter-box.service      "$STAGE/enter-box.service"
-          cp deploy/nftables/enter-box.nft         "$STAGE/enter-box.nft" 2>/dev/null || true
-          cp README.md                             "$STAGE/README.md"      2>/dev/null || true
-          cp docs/USERDOC.md                       "$STAGE/USERDOC.md"     2>/dev/null || true
-          cp docs/SIMPLE-README.md                 "$STAGE/SIMPLE-README.md" 2>/dev/null || true
+          cp "$BIN" "$STAGE/enter-box"
 
-          # tar.gz для Linux
+          # Всё остальное — по возможности. Чего нет — не повод падать.
+          [ -f enter-box.example.yaml ]           && cp enter-box.example.yaml           "$STAGE/"
+          [ -f deploy/systemd/enter-box.service ] && cp deploy/systemd/enter-box.service "$STAGE/"
+          [ -f deploy/nftables/enter-box.nft ]    && cp deploy/nftables/enter-box.nft    "$STAGE/"
+          [ -f README.md ]                        && cp README.md                        "$STAGE/"
+          [ -f docs/USERDOC.md ]                  && cp docs/USERDOC.md                  "$STAGE/"
+          [ -f docs/SIMPLE-README.md ]            && cp docs/SIMPLE-README.md            "$STAGE/"
+
           tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
-
-          # sha256
           (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
-
           rm -rf "$STAGE"
           ls -lh dist/
 
-      - name: Upload artifacts (даже без релиза)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: enter-box-${{ matrix.suffix }}
