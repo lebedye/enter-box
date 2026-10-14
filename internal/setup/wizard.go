@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"enter-box/internal/config"
+	"enter-box/internal/netcfg"
 )
 
 const defaultUnitPath = "/etc/systemd/system/enter-box.service"
@@ -32,17 +33,19 @@ func NewWizard(configPath string) *Wizard {
 // Run проходит весь сценарий установки.
 //
 // Порядок шагов важен:
-//  1. preflight     — критические проверки окружения;
-//  2. ensureSSH     — иначе после смены IP потеряем доступ;
-//  3. ensureNet*    — гасим менеджеры, чтобы не перезаписали IP;
-//  4. интерфейсы    — WAN/LAN;
-//  5. extra LAN     — WiFi/второй Ethernet (опционально);
-//  6. LAN/DHCP      — адрес шлюза и диапазон;
-//  7. warnLanChange — предупреждаем о смене IP на LAN;
-//  8. endpoints     — VPN-узлы;
-//  9. routing+DNS   — правила и DNS-сервер;
-//  10. confirm+save  — проверка и запись;
-//  11. systemd       — install + enable + start.
+//  1. preflight              — критические проверки окружения;
+//  2. ensureSSH              — иначе после смены IP потеряем доступ;
+//  3. ensureSystemManagers   — гасим systemd-networkd/dhcpcd (NM не трогаем!);
+//  4. интерфейсы             — WAN/LAN;
+//  5. extra LAN              — WiFi/второй Ethernet;
+//  6. configureNetworkManager— LAN переводим в unmanaged у NM;
+//  7. LAN/DHCP               — адрес шлюза и диапазон;
+//  8. warnLanChange          — предупреждаем о смене IP на LAN;
+//  9. endpoints              — VPN-узлы;
+//  10. routing+DNS           — правила и DNS-сервер;
+//  11. disableDNSStubListener— освобождаем порт 53;
+//  12. confirm+save          — проверка и запись;
+//  13. systemd               — install + enable + start.
 func (w *Wizard) Run() (*config.Config, error) {
 	w.p.Title("enter-box — интерактивная установка")
 
@@ -53,7 +56,7 @@ func (w *Wizard) Run() (*config.Config, error) {
 	if err := w.ensureSSH(); err != nil {
 		return nil, err
 	}
-	if err := w.ensureNetworkServicesDisabled(); err != nil {
+	if err := w.ensureSystemManagersDisabled(); err != nil {
 		return nil, err
 	}
 
@@ -63,6 +66,14 @@ func (w *Wizard) Run() (*config.Config, error) {
 	}
 
 	w.askExtraLAN(cfg)
+
+	// Настраиваем NM после того, как известны LAN и extra LAN.
+	if err := w.configureNetworkManager(cfg); err != nil {
+		w.p.Warn("NetworkManager: не удалось настроить unmanaged: %v", err)
+		w.p.Info("  LAN-интерфейсы могут конфликтовать с NM. Настройте вручную:")
+		w.p.Info("  файл /etc/NetworkManager/conf.d/99-enter-box-unmanaged.conf")
+	}
+
 	w.askLAN(cfg)
 
 	if err := w.warnLanChange(cfg); err != nil {
@@ -72,6 +83,15 @@ func (w *Wizard) Run() (*config.Config, error) {
 		return nil, err
 	}
 	w.askRouting(cfg)
+
+	// Освобождаем порт 53 — иначе DNS-сервер enter-box не стартует.
+	w.p.Title("Освобождение порта 53")
+	if err := netcfg.DisableDNSStubListener(); err != nil {
+		w.p.Warn("systemd-resolved: %v", err)
+		w.p.Info("  Если порт 53 занят — DNS-сервер enter-box не поднимется.")
+	} else {
+		w.p.OK("systemd-resolved: DNSStubListener отключён, порт 53 свободен")
+	}
 
 	if !w.confirm(cfg) {
 		return nil, fmt.Errorf("отменено пользователем")
@@ -106,14 +126,16 @@ func (w *Wizard) ensureSSH() error {
 	return nil
 }
 
-// ensureNetworkServicesDisabled гасит NetworkManager, systemd-networkd, dhcpcd.
-// Без этого они перезапишут IP на LAN-интерфейсе через минуту после старта
-// enter-box и сломают маршрутизацию.
+// ensureSystemManagersDisabled гасит systemd-networkd и dhcpcd.
 //
-// Применяем stop + disable + mask: mask нужен, чтобы сервис не поднялся
-// повторно как зависимость или при обновлении пакета.
-func (w *Wizard) ensureNetworkServicesDisabled() error {
-	conflicts := []string{"NetworkManager", "systemd-networkd", "dhcpcd"}
+// NetworkManager НЕ трогаем — он нужен:
+//   * для WAN (получение IP по DHCP от провайдера);
+//   * для Wi-Fi в режиме клиента (nmcli scan/connect).
+//
+// LAN-интерфейсы от NM защищаем через unmanaged-devices
+// (см. configureNetworkManager ниже).
+func (w *Wizard) ensureSystemManagersDisabled() error {
+	conflicts := []string{"systemd-networkd", "dhcpcd"}
 	var active []string
 	for _, svc := range conflicts {
 		if serviceState(svc) == "active" {
@@ -125,12 +147,13 @@ func (w *Wizard) ensureNetworkServicesDisabled() error {
 	}
 
 	w.p.Warn("Обнаружены активные сетевые менеджеры: %v", active)
-	w.p.Info("Они перезапишут IP на LAN-интерфейсе и сломают enter-box.")
-	w.p.Info("Рекомендуется отключить (stop + disable + mask).")
+	w.p.Info("Они могут перезаписать IP на LAN-интерфейсе и сломать enter-box.")
+	w.p.Info("")
+	w.p.Info("NetworkManager НЕ отключаем — он остаётся для WAN и Wi-Fi.")
+	w.p.Info("LAN-интерфейсы будут защищены через unmanaged-devices.")
 
-	if !w.p.AskYesNo("Отключить их сейчас?", true) {
+	if !w.p.AskYesNo("Отключить systemd-networkd/dhcpcd сейчас?", true) {
 		w.p.Warn("Отключение пропущено. Если что-то сломается — вернитесь сюда.")
-		w.p.Info("  Ручное отключение:")
 		for _, svc := range active {
 			w.p.Info("    sudo systemctl stop %s && sudo systemctl disable %s && sudo systemctl mask %s",
 				svc, svc, svc)
@@ -143,6 +166,27 @@ func (w *Wizard) ensureNetworkServicesDisabled() error {
 		_ = runSystemctl("disable", svc)
 		_ = runSystemctl("mask", svc)
 		w.p.OK("%s остановлен, отключён и замаскирован", svc)
+	}
+	return nil
+}
+
+// configureNetworkManager переводит LAN и extra LAN в unmanaged у NM.
+//
+// WAN остаётся под управлением NM: он получает IP по DHCP.
+func (w *Wizard) configureNetworkManager(cfg *config.Config) error {
+	unmanaged := []string{cfg.LAN.Interface}
+	unmanaged = append(unmanaged, cfg.LAN.ExtraInterfaces...)
+
+	if err := configureNetworkManagerUnmanaged(unmanaged); err != nil {
+		return err
+	}
+	w.p.OK("NetworkManager: интерфейсы %v переведены в unmanaged", unmanaged)
+
+	if err := reloadNetworkManager(); err != nil {
+		w.p.Warn("не удалось перезапустить NetworkManager: %v", err)
+		w.p.Info("  Конфиг подхватится при следующей перезагрузке.")
+	} else {
+		w.p.Info("  NetworkManager перезапущен, настройки применены.")
 	}
 	return nil
 }
@@ -168,7 +212,6 @@ func (w *Wizard) askInterfaces() (*config.Config, error) {
 	}
 	w.p.Info("")
 
-	// WAN.
 	wanIdx := guessWAN(ifaces, w.existing)
 	wanOptions := make([]string, len(ifaces))
 	for idx, ifc := range ifaces {
@@ -177,7 +220,6 @@ func (w *Wizard) askInterfaces() (*config.Config, error) {
 	wanChoice := w.p.AskChoice("Куда приходит интернет (WAN)?", wanOptions, wanIdx)
 	wan := ifaces[wanChoice]
 
-	// LAN — все остальные, кроме WAN.
 	remaining := make([]Iface, 0, len(ifaces)-1)
 	for _, ifc := range ifaces {
 		if ifc.Name != wan.Name {
@@ -240,9 +282,6 @@ func (w *Wizard) askExtraLAN(cfg *config.Config) {
 	}
 }
 
-// askWifiInterface выбирает беспроводной интерфейс и предлагает создать
-// AP-конфиг (SSID + пароль). Если пользователь соглашается — wizard
-// генерирует hostapd.conf, но НЕ запускает его автоматически.
 func (w *Wizard) askWifiInterface(mainLAN string) string {
 	ifaces, _ := DetectInterfaces()
 	var wifiIfaces []Iface
@@ -283,8 +322,6 @@ func (w *Wizard) askWifiInterface(mainLAN string) string {
 	return chosen
 }
 
-// writeHostapdConfig создаёт /etc/hostapd/hostapd.conf.
-// 2.4 GHz, WPA2-PSK, страна RU по умолчанию (правится вручную).
 func writeHostapdConfig(iface, ssid, password string) error {
 	conf := fmt.Sprintf(`# hostapd.conf для enter-box
 # Интерфейс: %s
@@ -337,7 +374,6 @@ func (w *Wizard) askLAN(cfg *config.Config) {
 		return
 	}
 
-	// Префикс берём из введённого адреса: 192.168.88.1/24 → 192.168.88
 	prefix := "192.168.88"
 	if host, _, ok := strings.Cut(cfg.LAN.Address, "/"); ok {
 		parts := strings.Split(host, ".")
@@ -359,10 +395,6 @@ func (w *Wizard) askLAN(cfg *config.Config) {
 	}
 }
 
-// warnLanChange предупреждает о смене IP на LAN-интерфейсе,
-// сравнивая текущий адрес с выбранным в askLAN.
-//
-// Вызывается ПОСЛЕ askLAN, иначе cfg.LAN.Address ещё не задан.
 func (w *Wizard) warnLanChange(cfg *config.Config) error {
 	curIP := interfaceIP(cfg.LAN.Interface)
 	if curIP == "" {
@@ -441,7 +473,7 @@ func (w *Wizard) askRouting(cfg *config.Config) {
 
 	if w.p.AskYesNo("Добавить свои домены, которые всегда напрямую?", false) {
 		cfg.Routing.DomesticDomains = w.p.AskMultiLine(
-			"Домены (по одному на строку):", "например: mycompany.ru")
+			"Домены (по одной на строку):", "например: mycompany.ru")
 	}
 
 	w.p.Title("Шаг 6/7. DNS")

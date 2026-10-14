@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/option"
@@ -43,7 +44,7 @@ func NewRunner(logger *slog.Logger, cfg *config.Config, pool *parser.Pool, opts 
 }
 
 func (r *Runner) Start(ctx context.Context) error {
-	// 1. Сеть: sysctl, LAN IP, nftables, static-IP unit.
+	// 1. Сеть: sysctl, LAN IP, nftables, static-IP unit, DNS stub off.
 	ns, err := netcfg.New(r.logger, r.cfg)
 	if err != nil {
 		return fmt.Errorf("netcfg init: %w", err)
@@ -52,6 +53,15 @@ func (r *Runner) Start(ctx context.Context) error {
 		return fmt.Errorf("netcfg apply: %w", err)
 	}
 	r.netSetup = ns
+
+	// 1b. Монитор LAN-интерфейсов: периодически поднимает упавшие.
+	//     Wi-Fi-чипы на Orange Pi часто сбрасывают AP при перегреве —
+	//     без монитора enter-box не заметит этого.
+	ifaces := append([]string{r.cfg.LAN.Interface}, r.cfg.LAN.ExtraInterfaces...)
+	if len(ifaces) > 0 {
+		mon := netcfg.NewIfaceMonitor(r.logger, ifaces, 30*time.Second)
+		go mon.Run(ctx)
+	}
 
 	// 2. AWG userspace.
 	r.awg = netcfg.NewAmneziaManager(r.logger)

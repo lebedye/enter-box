@@ -22,8 +22,17 @@ func New(logger *slog.Logger, cfg *config.Config) (*Setup, error) {
 }
 
 func (s *Setup) Apply(ctx context.Context) error {
-	// 0. Постоянный LAN-адрес: systemd-юнит, который ставит IP при загрузке
-	//    ДО enter-box. Страховка на случай, если enter-box не стартанул.
+	// 0a. Освобождаем порт 53 для встроенного DNS-сервера enter-box.
+	//     Без этого systemd-resolved займёт 0.0.0.0:53 и DNS не поднимется.
+	if err := DisableDNSStubListener(); err != nil {
+		s.logger.Warn("dnsfix: не удалось освободить порт 53", "err", err)
+		// Не прерываем: возможно, systemd-resolved уже не мешает.
+	} else {
+		s.logger.Info("dnsfix: порт 53 освобождён (DNSStubListener=no)")
+	}
+
+	// 0b. Постоянный LAN-адрес: systemd-юнит, который ставит IP при загрузке
+	//     ДО enter-box. Страховка на случай, если enter-box не стартанул.
 	if err := writeLanAddrUnit(s.cfg); err != nil {
 		s.logger.Warn("lan-addr unit", "err", err)
 	}
@@ -70,9 +79,6 @@ func (s *Setup) Cleanup() error {
 	return nil
 }
 
-// writeLanAddrUnit создаёт systemd-юнит enter-box-lan-addr.service,
-// который при каждой загрузке вешает статический IP на LAN-интерфейс.
-// Это гарантирует доступность по SSH, даже если enter-box не стартует.
 func writeLanAddrUnit(cfg *config.Config) error {
 	const svcPath = "/etc/systemd/system/enter-box-lan-addr.service"
 	const shPath = "/usr/local/bin/enter-box-lan-addr"
@@ -110,7 +116,6 @@ WantedBy=multi-user.target
 	return nil
 }
 
-// networkOf из "192.168.88.1/24" возвращает "192.168.88.0/24".
 func networkOf(addr string) string {
 	_, n, err := net.ParseCIDR(addr)
 	if err != nil {

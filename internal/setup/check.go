@@ -63,13 +63,26 @@ func Preflight() []Check {
 	})
 
 	// Конфликты.
-	for _, svc := range []string{"NetworkManager", "systemd-networkd", "dhcpcd"} {
+	//
+	// NetworkManager больше НЕ конфликтует: wizard переведёт LAN-интерфейсы
+	// в unmanaged, а сам NM останется для WAN (DHCP) и Wi-Fi (nmcli).
+	// Поэтому помечаем его как информацию, а не как проблему.
+	//
+	// systemd-networkd и dhcpcd — реальные конфликты: wizard их отключит.
+	if serviceState("NetworkManager") == "active" {
+		checks = append(checks, Check{
+			Name: "info:NetworkManager", OK: true, Critical: false,
+			Message: "NetworkManager активен (используется для WAN и Wi-Fi; wizard переведёт LAN в unmanaged)",
+		})
+	}
+
+	for _, svc := range []string{"systemd-networkd", "dhcpcd"} {
 		state := serviceState(svc)
 		if state == "active" {
 			checks = append(checks, Check{
 				Name: "conflict:" + svc, OK: false, Critical: false,
-				Message: svc + " активен и может мешать",
-				Fix:     fmt.Sprintf("sudo systemctl stop %s && sudo systemctl disable %s", svc, svc),
+				Message: svc + " активен и будет отключён wizard'ом",
+				Fix:     fmt.Sprintf("sudo systemctl stop %s && sudo systemctl disable %s && sudo systemctl mask %s", svc, svc, svc),
 			})
 		}
 	}
