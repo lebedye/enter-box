@@ -3,6 +3,7 @@ package singbox
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,9 +15,16 @@ import (
 )
 
 // newFakeClashClient поднимает httptest-сервер, имитирующий Clash API.
-// nodes — карта тег → функция-обработчик задержки (возвращает delay в мс
-// или блокируется до отмены контекста запроса).
+//
 // selectorAll — список тегов в селекторе "proxy".
+// delayFn возвращает задержку в мс для конкретного тега. Если delayFn
+// вернул <= 0, узел считается «висящим» — ответ не отправляется до
+// отмены контекста запроса. Это моделирует узел, который никогда не
+// отвечает.
+//
+// Служебные теги proxy-auto и direct не вызывают delayFn: в реальном
+// Clash API это селектор и прямой выход, у них нет задержки узла.
+// Фейк отвечает для них 404, чтобы findAliveNode не ждал их как VLESS.
 func newFakeClashClient(t *testing.T, selectorAll []string, delayFn func(tag string, r *http.Request) int) *proxyapi.Client {
 	t.Helper()
 
@@ -63,6 +71,13 @@ func newFakeClashClient(t *testing.T, selectorAll []string, delayFn func(tag str
 		// Извлекаем тег из /proxies/{tag}/delay.
 		trimmed := strings.TrimPrefix(path, "/proxies/")
 		tag := strings.TrimSuffix(trimmed, "/delay")
+
+		// Служебные теги: URLTest и прямой выход не имеют задержки узла.
+		// 404 гарантирует, что findAliveNode не будет ждать их как VLESS.
+		if tag == "proxy-auto" || tag == "direct" {
+			http.NotFound(w, r)
+			return
+		}
 
 		delay := delayFn(tag, r)
 		if delay <= 0 {
@@ -119,6 +134,11 @@ func TestFindAliveNode_PrefersLastGood(t *testing.T) {
 // остальных узлов. 20 узлов: первый отвечает сразу, остальные висят до
 // отмены контекста запроса. При корректной реализации функция вернётся
 // быстро (в пределах 3s), а не зависнет на запуске всех 20 проб.
+//
+// Служебные proxy-auto и direct в фейке отвечают 404 — как селектор и
+// прямой выход, у которых нет задержки узла. Если findAliveNode начнёт
+// возвращать proxy-auto вместо node01, это будет означать, что он
+// проверяет служебные теги как обычные узлы — баг в коде, а не в тесте.
 func TestFindAliveNode_DoesNotWaitAllProbes(t *testing.T) {
 	tags := []string{"proxy-auto", "node01"}
 	for i := 2; i <= 20; i++ {
@@ -148,10 +168,10 @@ func TestFindAliveNode_DoesNotWaitAllProbes(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if !alive {
-		t.Fatalf("ожидался живой узел, получено alive=false")
+		t.Fatalf("ожидался живой узел, получено alive=false (запущено проб: %d)", started)
 	}
 	if tag != "node01" {
-		t.Fatalf("ожидался node01, получено %q", tag)
+		t.Fatalf("ожидался node01, получено %q (запущено проб: %d)", tag, started)
 	}
 	if elapsed >= 3*time.Second {
 		t.Fatalf("findAliveNode не вернулся быстро: %v (запущено проб: %d)", elapsed, started)
@@ -160,8 +180,5 @@ func TestFindAliveNode_DoesNotWaitAllProbes(t *testing.T) {
 
 // twoDigits форматирует число 1..99 в двузначную строку с ведущим нулём.
 func twoDigits(n int) string {
-	if n < 10 {
-		return "0" + string(rune('0'+n))
-	}
-	return string(rune('0'+n/10)) + string(rune('0'+n%10))
+	return fmt.Sprintf("%02d", n)
 }
