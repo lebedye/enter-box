@@ -2,21 +2,39 @@
 /dist/
 /enter-box
 /enter-box-arm64
+/enter-box-linux-arm64
 /enter-box.exe
+/enter-box.install
 
-# Локальные конфиги (не коммитим!)
-/enter-box.yaml
-/*.local.yaml
-
-# Логи и временные файлы
+# Временные файлы установщика
+*.new
+*.bak.*
+*.prev.*
 *.log
 *.pid
 *.tmp
 
-# IDE
+# Секреты и локальные конфиги
+/enter-box.yaml
+/*.local.yaml
+*.vpn
+.env
+.env.*
+preflight.json
+
+# Артефакты тестов
+coverage.out
+*.test
+
+# Релизы
+dist/release/
+*.tar.gz
+
+# IDE и редакторы
 .idea/
 .vscode/
 *.swp
+*.swo
 
 # OS
 .DS_Store

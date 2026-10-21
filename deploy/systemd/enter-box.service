@@ -5,6 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Закрытый кэш подписок переживает отсутствие сети при загрузке платы.
+Environment=ENTER_BOX_SUBS_CACHE_DIR=/var/lib/enter-box/subscriptions
+# systemd создаёт постоянное закрытое хранилище выбора серверов и подписок.
+StateDirectory=enter-box
+StateDirectoryMode=0700
+# Общая блокировка выбора доступна SSH-клиенту без доступа к секретным файлам.
+RuntimeDirectory=enter-box-control
+RuntimeDirectoryMode=0755
+# Сохраняем inode блокировки при restart службы, пока SSH-клиент ещё работает.
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/local/bin/enter-box run -c /etc/enter-box/enter-box.yaml
 Restart=on-failure
 RestartSec=3

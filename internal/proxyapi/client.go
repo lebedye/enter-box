@@ -12,6 +12,7 @@ package proxyapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -96,7 +97,7 @@ func (c *Client) ActiveNode() (string, error) {
 	return p.Now, nil
 }
 
-// AutoNode возвращает текущий узел, выбранный urltest.
+// AutoNode возвращает текущий узел, выбранный селектором "proxy-auto".
 func (c *Client) AutoNode() (string, error) {
 	p, err := c.GetProxy("proxy-auto")
 	if err != nil {
@@ -106,8 +107,13 @@ func (c *Client) AutoNode() (string, error) {
 }
 
 // TestDelay форсированно измеряет задержку узла.
-// tag может быть любым узлом, включая "proxy-auto" (тогда прогоняются все).
+// Для selector проверяется его текущий выход, а не все члены группы.
 func (c *Client) TestDelay(tag, testURL string, timeout time.Duration) (int, error) {
+	return c.TestDelayContext(context.Background(), tag, testURL, timeout)
+}
+
+// TestDelayContext — TestDelay с поддержкой отмены через ctx.
+func (c *Client) TestDelayContext(ctx context.Context, tag, testURL string, timeout time.Duration) (int, error) {
 	if testURL == "" {
 		testURL = "http://cp.cloudflare.com/generate_204"
 	}
@@ -117,11 +123,19 @@ func (c *Client) TestDelay(tag, testURL string, timeout time.Duration) (int, err
 	u := fmt.Sprintf("%s/proxies/%s/delay?url=%s&timeout=%d",
 		c.Base, url.PathEscape(tag), url.QueryEscape(testURL), timeout.Milliseconds())
 
-	resp, err := c.HTTP.Get(u)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("clash api недоступен: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return 0, fmt.Errorf("clash api %d: %s", resp.StatusCode, string(body))
+	}
 
 	var data struct {
 		Delay int    `json:"delay"`
@@ -136,11 +150,41 @@ func (c *Client) TestDelay(tag, testURL string, timeout time.Duration) (int, err
 	return data.Delay, nil
 }
 
+// Probe проверяет узел по двум независимым HTTPS-целям.
+// Возвращает задержку первого успешного ответа; если обе цели недоступны —
+// общую ошибку. Отмена ctx прерывает проверку.
+func (c *Client) Probe(ctx context.Context, tag string) (int, error) {
+	targets := []string{
+		"https://1.1.1.1/cdn-cgi/trace",
+		"https://8.8.8.8/resolve?name=example.com&type=A",
+	}
+	for _, target := range targets {
+		delay, err := c.TestDelayContext(ctx, tag, target, 2*time.Second)
+		if err == nil && delay > 0 {
+			return delay, nil
+		}
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+	}
+	return 0, fmt.Errorf("probe %s: все цели недоступны", tag)
+}
+
 // Switch переключает selector "proxy" на конкретный узел.
 // Чтобы вернуться к автоматике — передай tag = "proxy-auto".
 func (c *Client) Switch(tag string) error {
+	unlock, err := c.LockControl()
+	if err != nil { return err }
+	defer unlock()
+	return c.SwitchGroup("proxy", tag)
+}
+
+// SwitchGroup переключает произвольную selector-группу на узел tag.
+// Используется failover'ом для "proxy-auto" (узел или direct).
+func (c *Client) SwitchGroup(group, tag string) error {
 	body, _ := json.Marshal(map[string]string{"name": tag})
-	req, err := http.NewRequest(http.MethodPut, c.Base+"/proxies/proxy", bytes.NewReader(body))
+	u := fmt.Sprintf("%s/proxies/%s", c.Base, url.PathEscape(group))
+	req, err := http.NewRequest(http.MethodPut, u, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -165,17 +209,32 @@ type NodeInfo struct {
 	Delay string // "42ms" / "-"
 }
 
-// Snapshot возвращает отсортированный список узлов для отображения.
+// Snapshot возвращает отсортированный список реальных VPN-узлов для отображения.
+//
+// Узлы берём из списка all селектора "proxy", а не по типу: AWG-узлы тоже
+// имеют тип Direct, поэтому фильтрация по типу их скрывала, зато пропускала
+// служебные GLOBAL (Fallback) и block (Reject). Служебные теги proxy-auto
+// (urltest) и direct исключаем явно.
 func (c *Client) Snapshot() ([]NodeInfo, error) {
 	proxies, err := c.ListProxies()
 	if err != nil {
 		return nil, err
 	}
+
+	selector, ok := proxies["proxy"]
+	if !ok {
+		return nil, fmt.Errorf("clash api: селектор \"proxy\" отсутствует")
+	}
+
 	var out []NodeInfo
-	for name, p := range proxies {
-		switch p.Type {
-		case "Selector", "URLTest", "Direct", "Block", "DNS":
+	for _, name := range selector.All {
+		// Служебные теги: urltest-группа и прямой выход.
+		if name == "proxy-auto" || name == "direct" {
 			continue
+		}
+		p, ok := proxies[name]
+		if !ok {
+			return nil, fmt.Errorf("clash api: узел %q из селектора \"proxy\" отсутствует в /proxies", name)
 		}
 		alive := "?"
 		if p.Alive != nil {

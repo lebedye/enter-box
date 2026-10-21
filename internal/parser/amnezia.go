@@ -1,27 +1,15 @@
 package parser
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
 )
-
-type amneziaRoot struct {
-	HostName   string             `json:"hostName"`
-	Containers []amneziaContainer `json:"containers"`
-}
-
-type amneziaContainer struct {
-	Container string      `json:"container"`
-	AWG       *amneziaCfg `json:"awg,omitempty"`
-	WG        *amneziaCfg `json:"wg,omitempty"`
-}
-
-type amneziaCfg struct {
-	LastConfig string `json:"last_config"`
-}
 
 func ParseVPN(raw string) (*Endpoint, error) {
 	payload := strings.TrimPrefix(raw, "vpn://")
@@ -29,25 +17,90 @@ func ParseVPN(raw string) (*Endpoint, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vpn: base64: %w", err)
 	}
-	var root amneziaRoot
+	dec, err = decompressAmneziaPayload(dec)
+	if err != nil {
+		return nil, fmt.Errorf("vpn: unpack: %w", err)
+	}
+	var root map[string]any
 	if err := json.Unmarshal(dec, &root); err != nil {
 		return nil, fmt.Errorf("vpn: json: %w", err)
 	}
-	var ini string
-	for _, c := range root.Containers {
-		if c.AWG != nil && c.AWG.LastConfig != "" {
-			ini = c.AWG.LastConfig
-			break
-		}
-		if c.WG != nil && c.WG.LastConfig != "" {
-			ini = c.WG.LastConfig
-			break
-		}
-	}
+	// Формат Amnezia менялся: старые ключи хранят last_config,
+	// новые — client_config.native_config. Ищем сам INI по признакам,
+	// чтобы не ломаться при очередном переименовании обёртки.
+	ini := findAmneziaINI(root)
 	if ini == "" {
-		return nil, fmt.Errorf("vpn: no awg/wg last_config")
+		return nil, fmt.Errorf("vpn: no AWG/WireGuard native config")
 	}
-	return parseAmneziaINI(ini, raw, root.HostName)
+	hostname, _ := root["hostName"].(string)
+	if hostname == "" {
+		hostname, _ = root["name"].(string)
+	}
+	return parseAmneziaINI(ini, raw, hostname)
+}
+
+func decompressAmneziaPayload(data []byte) ([]byte, error) {
+	// qCompress пишет размер JSON в первых четырёх байтах,
+	// а затем обычный zlib-поток. Без этого новые vpn:// не читались.
+	if len(data) >= 6 {
+		zr, err := zlib.NewReader(bytes.NewReader(data[4:]))
+		if err == nil {
+			plain, readErr := io.ReadAll(zr)
+			_ = zr.Close()
+			// Некоторые версии Amnezia записывают неточный размер в заголовке.
+			// Валидный распакованный JSON является более надёжной проверкой.
+			if readErr == nil && json.Valid(plain) {
+				return plain, nil
+			}
+		}
+	}
+	if json.Valid(data) {
+		return data, nil
+	}
+	return nil, fmt.Errorf("payload is neither qCompress nor JSON")
+}
+
+func findAmneziaINI(value any) string {
+	switch v := value.(type) {
+	case string:
+		// Gateway может завернуть native_config ещё в одну JSON-строку.
+		// Сначала раскрываем такую обёртку, иначе парсер примет весь JSON за INI.
+		if strings.HasPrefix(strings.TrimSpace(v), "{") {
+			var nested any
+			if json.Unmarshal([]byte(v), &nested) == nil {
+				if found := findAmneziaINI(nested); found != "" {
+					return found
+				}
+			}
+		}
+		if strings.Contains(v, "[Interface]") && strings.Contains(v, "[Peer]") {
+			return v
+		}
+	case []any:
+		for _, item := range v {
+			if found := findAmneziaINI(item); found != "" {
+				return found
+			}
+		}
+	case map[string]any:
+		// Сначала проверяем точные ключи, чтобы не взять похожую
+		// серверную заготовку раньше клиентской конфигурации.
+		for _, key := range []string{"native_config", "last_config", "config"} {
+			if s, ok := v[key].(string); ok && strings.Contains(s, "[Interface]") && strings.Contains(s, "[Peer]") {
+				// last_config сам может быть JSON-строкой с полем config.
+				// Пропускаем значение через ту же рекурсию, чтобы раскрыть обёртку.
+				if found := findAmneziaINI(s); found != "" {
+					return found
+				}
+			}
+		}
+		for _, item := range v {
+			if found := findAmneziaINI(item); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
 }
 
 var reIPv6Endpoint = regexp.MustCompile(`^\[(.+)\]:(\d+)$`)
@@ -94,14 +147,18 @@ func parseAmneziaINI(cfg, raw, hostname string) (*Endpoint, error) {
 				awg.S1, _ = strconv.Atoi(val)
 			case "s2":
 				awg.S2, _ = strconv.Atoi(val)
+			case "s3":
+				awg.S3, _ = strconv.Atoi(val)
+			case "s4":
+				awg.S4, _ = strconv.Atoi(val)
 			case "h1":
-				awg.H1 = parseIntFlexible(val)
+				awg.H1 = unquote(val)
 			case "h2":
-				awg.H2 = parseIntFlexible(val)
+				awg.H2 = unquote(val)
 			case "h3":
-				awg.H3 = parseIntFlexible(val)
+				awg.H3 = unquote(val)
 			case "h4":
-				awg.H4 = parseIntFlexible(val)
+				awg.H4 = unquote(val)
 			case "i1":
 				awg.I1 = unquote(val)
 			case "i2":
@@ -112,6 +169,24 @@ func parseAmneziaINI(cfg, raw, hostname string) (*Endpoint, error) {
 				awg.I4 = unquote(val)
 			case "i5":
 				awg.I5 = unquote(val)
+			case "headerprotectionkey":
+				awg.HeaderProtectionKey = unquote(val)
+			case "contentpaddingaddition":
+				awg.ContentPaddingAddition = unquote(val)
+			case "rekeyaftertime":
+				awg.RekeyAfterTime = unquote(val)
+			case "rekeytimeout":
+				awg.RekeyTimeout = unquote(val)
+			case "rejectaftertime":
+				awg.RejectAfterTime = unquote(val)
+			case "keepalivetimeout":
+				awg.KeepaliveTimeout = unquote(val)
+			case "maxhandshakeattempts":
+				awg.MaxHandshakeAttempts = unquote(val)
+			case "randomtrailers":
+				awg.RandomTrailers = parseToggle(val)
+			case "disablecookies":
+				awg.DisableCookies = parseToggle(val)
 			}
 		case "peer":
 			switch key {
@@ -125,6 +200,8 @@ func parseAmneziaINI(cfg, raw, hostname string) (*Endpoint, error) {
 				} else if h, p, ok := strings.Cut(val, ":"); ok {
 					peerHost, peerPort = h, p
 				}
+			case "persistentkeepalive":
+				awg.PersistentKeepalive = unquote(val)
 			}
 		}
 	}
@@ -170,4 +247,15 @@ func unquote(s string) string {
 		return s[1 : len(s)-1]
 	}
 	return s
+}
+
+func parseToggle(s string) int {
+	// AWG принимает флаги как 0/1, а экспорт может записать
+	// их словами true/false.
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return 1
+	default:
+		return 0
+	}
 }

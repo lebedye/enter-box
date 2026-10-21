@@ -32,6 +32,10 @@ func New(logger *slog.Logger, cfg *config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Проверяем, что шлюз задан корректным IPv4-адресом.
+	if net.ParseIP(cfg.LAN.DHCP.Gateway).To4() == nil {
+		return nil, fmt.Errorf("invalid dhcp gateway %q", cfg.LAN.DHCP.Gateway)
+	}
 	ifaces := append([]string{cfg.LAN.Interface}, cfg.LAN.ExtraInterfaces...)
 	return &Server{
 		logger: logger,
@@ -73,20 +77,48 @@ func (s *Server) handle(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4) 
 	serverIP := net.ParseIP(s.cfg.LAN.DHCP.Gateway)
 	mac := req.ClientHWAddr
 
-	lease := s.pool.Offer(mac)
-	if lease == nil {
-		s.logger.Warn("dhcp pool exhausted", "mac", mac.String())
+	// Пакет без MAC-адреса обработать нельзя — молча игнорируем.
+	if len(mac) == 0 {
+		s.logger.Warn("dhcp packet without client mac")
 		return
 	}
 
+	// Определяем тип ответа ДО выделения аренды, чтобы не занимать
+	// адрес под неподдерживаемые сообщения.
 	var msgType dhcpv4.MessageType
 	switch req.MessageType() {
 	case dhcpv4.MessageTypeDiscover:
 		msgType = dhcpv4.MessageTypeOffer
 	case dhcpv4.MessageTypeRequest:
 		msgType = dhcpv4.MessageTypeAck
+	case dhcpv4.MessageTypeRelease:
+		// Клиент освобождает адрес — удаляем аренду и не отвечаем.
+		s.pool.Release(mac)
+		return
 	default:
 		return
+	}
+
+	// REQUEST, адресованный другому серверу, игнорируем до выделения аренды.
+	if req.MessageType() == dhcpv4.MessageTypeRequest {
+		if sid := req.ServerIdentifier(); sid != nil && !sid.Equal(serverIP) {
+			return
+		}
+	}
+
+	lease := s.pool.Offer(mac)
+	if lease == nil {
+		s.logger.Warn("dhcp pool exhausted", "mac", mac.String())
+		return
+	}
+
+	// Проверка запрошенного адреса применяется только к REQUEST:
+	// DISCOVER может нести старый предпочитаемый IP, но всё равно
+	// должен получить OFFER с адресом из пула.
+	if req.MessageType() == dhcpv4.MessageTypeRequest {
+		if reqIP := req.RequestedIPAddress(); reqIP != nil && !reqIP.Equal(lease.IP) {
+			return
+		}
 	}
 
 	// Маска из lan.address.
@@ -99,6 +131,8 @@ func (s *Server) handle(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4) 
 	resp, err := dhcpv4.NewReplyFromRequest(req,
 		dhcpv4.WithMessageType(msgType),
 		dhcpv4.WithServerIP(serverIP),
+		// WithServerIP задаёт только siaddr; option 54 нужно добавить явно.
+		dhcpv4.WithOption(dhcpv4.OptServerIdentifier(serverIP)),
 		dhcpv4.WithYourIP(lease.IP),
 		dhcpv4.WithOption(dhcpv4.OptSubnetMask(mask)),
 		dhcpv4.WithOption(dhcpv4.OptRouter(serverIP)),

@@ -31,9 +31,12 @@ func (s *Setup) Apply(ctx context.Context) error {
 		s.logger.Info("dnsfix: порт 53 освобождён (DNSStubListener=no)")
 	}
 
-	// 0b. Постоянный LAN-адрес: systemd-юнит, который ставит IP при загрузке
-	//     ДО enter-box. Страховка на случай, если enter-box не стартанул.
-	if err := writeLanAddrUnit(s.cfg); err != nil {
+	// 0b. При активном NetworkManager постоянным адресом владеет его профиль,
+	//     созданный setup. Второй systemd-юнит здесь вызвал бы гонку за адрес.
+	if networkManagerActive() {
+		disableLegacyLanAddrUnit()
+		s.logger.Info("LAN address is managed by NetworkManager")
+	} else if err := writeLanAddrUnit(s.cfg); err != nil {
 		s.logger.Warn("lan-addr unit", "err", err)
 	}
 
@@ -71,6 +74,19 @@ func (s *Setup) Apply(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func networkManagerActive() bool {
+	return exec.Command("systemctl", "is-active", "--quiet", "NetworkManager").Run() == nil
+}
+
+func disableLegacyLanAddrUnit() {
+	// Убираем только ранее созданный enter-box unit; чужие сетевые службы
+	// и профили NetworkManager не затрагиваются.
+	_ = exec.Command("systemctl", "disable", "--now", "enter-box-lan-addr.service").Run()
+	_ = os.Remove("/etc/systemd/system/enter-box-lan-addr.service")
+	_ = os.Remove("/usr/local/bin/enter-box-lan-addr")
+	_ = exec.Command("systemctl", "daemon-reload").Run()
 }
 
 func (s *Setup) Cleanup() error {

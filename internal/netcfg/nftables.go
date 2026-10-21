@@ -34,7 +34,7 @@ delete table inet %[1]s
 
 table inet %[1]s {
   chain forward {
-    type filter hook forward priority filter; policy accept;
+    type filter hook forward priority filter; policy drop;
     ct state established,related accept
 %[2]s  }
   chain postrouting {

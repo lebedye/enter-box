@@ -1,0 +1,47 @@
+# Базовая конфигурация для ARM64 SBC с USB-модемом или Ethernet-аплинком.
+# WAN и LAN переопределяются в установочном скрипте.
+log:
+  level: info
+
+wan:
+  name: eth1
+
+lan:
+  interface: eth0
+  address: 192.168.88.1/24
+  dhcp:
+    enabled: true
+    range_start: 192.168.88.100
+    range_end: 192.168.88.220
+    lease_time: 12h
+    gateway: 192.168.88.1
+
+tun:
+  interface: tun0
+  address: 10.10.10.1/24
+  mtu: 1380
+  stack: system
+
+dns:
+  serve: true
+  domestic: ["77.88.8.8", "77.88.8.1"]
+  remote: ["1.1.1.1", "8.8.8.8"]
+
+# Файл имеет права 0600; ключ не попадает в YAML и историю shell.
+endpoint_files:
+  - /etc/enter-box/premium.vpn
+
+routing:
+  use_ru_direct: true
+  domestic_domains: []
+  # ru/xn--p1ai также зашиты в генератор как независимое правило.
+  domestic_suffix: ["ru", "рф", "xn--p1ai"]
+  domestic_ip_cidr: []
+  force_proxy: []
+  # urltest оставлен для совместимости; активный выбор узла
+  # выполняется автоматикой с окном 10 с.
+  urltest_interval: 3m
+  urltest_url: http://cp.cloudflare.com/generate_204
+  urltest_tolerance: 50
+  preferred: ""
+  final: proxy

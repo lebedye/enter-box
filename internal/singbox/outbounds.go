@@ -3,6 +3,7 @@ package singbox
 
 import (
 	"fmt"
+	"strings"
 
 	"enter-box/internal/parser"
 )
@@ -15,6 +16,8 @@ func buildOutbound(ep *parser.Endpoint) (map[string]any, error) {
 		return buildVMess(ep)
 	case parser.KindAmnezia:
 		return buildAmnezia(ep)
+	case parser.KindHysteria2:
+		return buildHysteria2(ep)
 	}
 	return nil, fmt.Errorf("unsupported kind %s", ep.Kind)
 }
@@ -69,6 +72,37 @@ func buildAmnezia(ep *parser.Endpoint) (map[string]any, error) {
 	}, nil
 }
 
+// buildHysteria2 собирает outbound type=hysteria2.
+// Пароль берётся из Params["password"] (уже раскодирован парсером).
+// obfs добавляется только если в ссылке есть obfs и obfs-password.
+// insecure включается только при явном insecure=1/true.
+func buildHysteria2(ep *parser.Endpoint) (map[string]any, error) {
+	password := ep.Params.Get("password")
+	if password == "" {
+		return nil, fmt.Errorf("hysteria2: missing password")
+	}
+	o := map[string]any{
+		"type":        "hysteria2",
+		"tag":         ep.Tag,
+		"server":      ep.Server,
+		"server_port": ep.Port,
+		"password":    password,
+	}
+	if tls := buildTLS(ep); tls != nil {
+		o["tls"] = tls
+	}
+	// obfs имеет смысл только в паре с паролем обфускации.
+	if obfs := ep.Params.Get("obfs"); obfs != "" {
+		if obfsPass := ep.Params.Get("obfs-password"); obfsPass != "" {
+			o["obfs"] = map[string]any{
+				"type":     obfs,
+				"password": obfsPass,
+			}
+		}
+	}
+	return o, nil
+}
+
 func buildTLS(ep *parser.Endpoint) map[string]any {
 	if ep.Security != "tls" && ep.Security != "reality" {
 		return nil
@@ -77,11 +111,34 @@ func buildTLS(ep *parser.Endpoint) map[string]any {
 		"enabled":     true,
 		"server_name": ep.SNI,
 	}
-	if ep.Fingerprint != "" {
+	// Reality без явного fingerprint должен получить utls=chrome,
+	// иначе sing-box не сможет установить соединение.
+	fp := ep.Fingerprint
+	if fp == "" && ep.Security == "reality" {
+		fp = "chrome"
+	}
+	if fp != "" {
 		tls["utls"] = map[string]any{
 			"enabled":     true,
-			"fingerprint": ep.Fingerprint,
+			"fingerprint": fp,
 		}
+	}
+	// ALPN передаётся списком через запятую: alpn=h2,http/1.1.
+	if alpn := ep.Params.Get("alpn"); alpn != "" {
+		parts := strings.Split(alpn, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		if len(out) > 0 {
+			tls["alpn"] = out
+		}
+	}
+	// insecure — только при явном запросе, чтобы не ослаблять TLS по умолчанию.
+	if v := ep.Params.Get("insecure"); v == "1" || strings.EqualFold(v, "true") {
+		tls["insecure"] = true
 	}
 	if ep.Security == "reality" {
 		tls["reality"] = map[string]any{

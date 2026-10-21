@@ -37,6 +37,10 @@ dns:
 endpoints:
   - "vless://00000000-0000-0000-0000-000000000000@vps.example.com:443?type=tcp&security=reality&sni=www.cloudflare.com&pbk=PUBLIC_KEY&sid=ab&fp=chrome&flow=xtls-rprx-vision#my-vless"
 
+# Premium-ключ Amnezia безопаснее хранить отдельно с правами 0600.
+endpoint_files:
+  # - /etc/enter-box/amnezia-premium.vpn
+
 subscriptions:
   # - url: https://provider.com/api/sub/TOKEN
   #   tag: provider
@@ -55,6 +59,8 @@ routing:
     - .рф
   domestic_ip_cidr: []
   force_proxy: []
+  # Старые параметры сохранены для совместимости; новый auto держит
+  # исправный сервер и применяет десятисекундное окно отказа.
   urltest_interval: 3m
   urltest_url: http://cp.cloudflare.com/generate_204
   urltest_tolerance: 50

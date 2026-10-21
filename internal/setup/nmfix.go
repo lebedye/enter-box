@@ -2,84 +2,136 @@ package setup
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"strings"
+
+	"enter-box/internal/config"
 )
 
 const (
-	nmConfDir  = "/etc/NetworkManager/conf.d"
-	nmConfFile = nmConfDir + "/99-enter-box-unmanaged.conf"
+	// nmLegacyConfFile — файл старой схемы. Она делала LAN
+	// unmanaged, из-за чего NetworkManager и enter-box спорили за IP.
+	nmLegacyConfFile = "/etc/NetworkManager/conf.d/99-enter-box-unmanaged.conf"
+	nmLANPrefix      = "enter-box-lan-"
 )
 
-// configureNetworkManagerUnmanaged записывает drop-in конфиг NetworkManager,
-// переводящий указанные интерфейсы в статус unmanaged.
+// configureNetworkManagerLAN оставляет NetworkManager единственным
+// владельцем постоянного LAN-адреса. enter-box после этого
+// настраивает только DHCP, VPN, маршрутизацию и firewall.
 //
-// Зачем: enter-box полностью управляет LAN-интерфейсами (вешает IP,
-// маршрутизирует, поднимает DHCP-сервер). Если NetworkManager тоже будет
-// ими управлять — он сбросит IP и сломает маршрутизацию.
-//
-// При этом сам NetworkManager остаётся активным:
-//   * WAN — NM получает IP по DHCP от провайдера;
-//   * Wi-Fi в режиме клиента — NM управляет подключением через nmcli.
-//
-// Функция идемпотентна — повторный вызов перезаписывает конфиг.
-func configureNetworkManagerUnmanaged(ifaces []string) error {
-	// Чистим от пустых и дубликатов.
-	uniq := make([]string, 0, len(ifaces))
-	seen := make(map[string]struct{}, len(ifaces))
-	for _, n := range ifaces {
-		n = strings.TrimSpace(n)
-		if n == "" {
-			continue
-		}
-		if _, ok := seen[n]; ok {
-			continue
-		}
-		seen[n] = struct{}{}
-		uniq = append(uniq, n)
-	}
-	if len(uniq) == 0 {
+// Если setup запущен по SSH через тот же LAN, уже назначенные
+// IPv4-адреса сохраняются как дополнительные. Это не обрывает
+// текущую сессию; старый адрес можно удалить после проверки.
+func configureNetworkManagerLAN(cfg *config.Config) error {
+	if serviceState("NetworkManager") != "active" {
 		return nil
 	}
-
-	if err := os.MkdirAll(nmConfDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", nmConfDir, err)
+	if _, err := exec.LookPath("nmcli"); err != nil {
+		return fmt.Errorf("NetworkManager active, but nmcli not found")
+	}
+	// Удаляем только старый файл enter-box, чужие настройки NM
+	// не трогаем.
+	if err := os.Remove(nmLegacyConfFile); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove obsolete NetworkManager config: %w", err)
 	}
 
-	// Формат NM: unmanaged-devices=interface-name:eth0;interface-name:eth1
-	var expr strings.Builder
-	for i, n := range uniq {
-		if i > 0 {
-			expr.WriteByte(';')
+	ifaces := append([]string{cfg.LAN.Interface}, cfg.LAN.ExtraInterfaces...)
+	for i, iface := range ifaces {
+		address := ""
+		if i == 0 {
+			address = cfg.LAN.Address
 		}
-		expr.WriteString("interface-name:")
-		expr.WriteString(n)
-	}
-
-	content := fmt.Sprintf(`# Автоматически создано enter-box (setup wizard).
-#
-# NetworkManager не управляет этими интерфейсами — их полностью
-# контролирует enter-box (IP, DHCP, nftables).
-#
-# ВАЖНО: не добавляйте сюда WAN-интерфейс, если провайдер выдаёт
-# IP по DHCP — иначе адрес не будет получен.
-# Не добавляйте сюда Wi-Fi в режиме клиента — им должен управлять NM.
-
-[keyfile]
-unmanaged-devices=%s
-`, expr.String())
-
-	if err := os.WriteFile(nmConfFile, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", nmConfFile, err)
+		if err := configureNMInterface(iface, address); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// reloadNetworkManager перезапускает NetworkManager, чтобы он перечитал
-// conf.d. Если NM не активен — ничего не делает.
-func reloadNetworkManager() error {
-	if serviceState("NetworkManager") != "active" {
+func configureNMInterface(iface, wantedAddress string) error {
+	iface = strings.TrimSpace(iface)
+	if iface == "" {
 		return nil
 	}
-	return runSystemctl("restart", "NetworkManager")
+	connection := activeNMConnection(iface)
+	if connection == "" || connection == "--" {
+		connection = nmLANPrefix + iface
+		args := []string{"connection", "add", "type", "ethernet", "ifname", iface,
+			"con-name", connection, "connection.autoconnect", "yes"}
+		if out, err := exec.Command("nmcli", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("nmcli add LAN profile %s: %w (%s)", iface, err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	addresses := currentIPv4Addresses(iface)
+	if wantedAddress != "" && !containsAddress(addresses, wantedAddress) {
+		addresses = append([]string{wantedAddress}, addresses...)
+	}
+	if len(addresses) == 0 {
+		return fmt.Errorf("LAN interface %s has no IPv4 address", iface)
+	}
+	args := []string{"connection", "modify", connection,
+		"connection.interface-name", iface,
+		"connection.autoconnect", "yes",
+		"ipv4.method", "manual",
+		"ipv4.addresses", strings.Join(addresses, ","),
+		"ipv4.gateway", "",
+		"ipv4.never-default", "yes",
+		"ipv4.ignore-auto-dns", "yes",
+		"ipv6.method", "disabled"}
+	if out, err := exec.Command("nmcli", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("nmcli modify LAN profile %s: %w (%s)", iface, err, strings.TrimSpace(string(out)))
+	}
+
+	// reapply меняет адреса без down/up и поэтому безопаснее
+	// при удалённой настройке по SSH.
+	if out, err := exec.Command("nmcli", "device", "reapply", iface).CombinedOutput(); err != nil {
+		return fmt.Errorf("nmcli reapply %s: %w (%s)", iface, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func activeNMConnection(iface string) string {
+	out, err := exec.Command("nmcli", "-g", "GENERAL.CONNECTION", "device", "show", iface).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func currentIPv4Addresses(iface string) []string {
+	device, err := net.InterfaceByName(iface)
+	if err != nil {
+		return nil
+	}
+	addrs, err := device.Addrs()
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		ip, network, err := net.ParseCIDR(addr.String())
+		if err != nil || ip.To4() == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		ones, _ := network.Mask.Size()
+		out = append(out, fmt.Sprintf("%s/%d", ip.String(), ones))
+	}
+	return out
+}
+
+func containsAddress(addresses []string, wanted string) bool {
+	wantedIP, _, err := net.ParseCIDR(wanted)
+	if err != nil {
+		return false
+	}
+	for _, address := range addresses {
+		ip, _, err := net.ParseCIDR(address)
+		if err == nil && ip.Equal(wantedIP) {
+			return true
+		}
+	}
+	return false
 }

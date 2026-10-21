@@ -18,6 +18,7 @@ type Config struct {
 	DNS           DNSConfig            `yaml:"dns"`
 	Subscriptions []SubscriptionConfig `yaml:"subscriptions"`
 	Endpoints     []string             `yaml:"endpoints"`
+	EndpointFiles []string             `yaml:"endpoint_files,omitempty"`
 	Routing       RoutingConfig        `yaml:"routing"`
 }
 

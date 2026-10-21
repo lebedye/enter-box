@@ -132,8 +132,7 @@ func (w *Wizard) ensureSSH() error {
 //   * для WAN (получение IP по DHCP от провайдера);
 //   * для Wi-Fi в режиме клиента (nmcli scan/connect).
 //
-// LAN-интерфейсы от NM защищаем через unmanaged-devices
-// (см. configureNetworkManager ниже).
+// LAN-адреса закрепляем в постоянном профиле NetworkManager.
 func (w *Wizard) ensureSystemManagersDisabled() error {
 	conflicts := []string{"systemd-networkd", "dhcpcd"}
 	var active []string
@@ -150,7 +149,7 @@ func (w *Wizard) ensureSystemManagersDisabled() error {
 	w.p.Info("Они могут перезаписать IP на LAN-интерфейсе и сломать enter-box.")
 	w.p.Info("")
 	w.p.Info("NetworkManager НЕ отключаем — он остаётся для WAN и Wi-Fi.")
-	w.p.Info("LAN-интерфейсы будут защищены через unmanaged-devices.")
+	w.p.Info("LAN-адреса будут закреплены в профиле NetworkManager.")
 
 	if !w.p.AskYesNo("Отключить systemd-networkd/dhcpcd сейчас?", true) {
 		w.p.Warn("Отключение пропущено. Если что-то сломается — вернитесь сюда.")
@@ -170,24 +169,13 @@ func (w *Wizard) ensureSystemManagersDisabled() error {
 	return nil
 }
 
-// configureNetworkManager переводит LAN и extra LAN в unmanaged у NM.
-//
-// WAN остаётся под управлением NM: он получает IP по DHCP.
+// configureNetworkManager делает LAN-профиль статическим,
+// без gateway и default route. WAN-профил не изменяется.
 func (w *Wizard) configureNetworkManager(cfg *config.Config) error {
-	unmanaged := []string{cfg.LAN.Interface}
-	unmanaged = append(unmanaged, cfg.LAN.ExtraInterfaces...)
-
-	if err := configureNetworkManagerUnmanaged(unmanaged); err != nil {
+	if err := configureNetworkManagerLAN(cfg); err != nil {
 		return err
 	}
-	w.p.OK("NetworkManager: интерфейсы %v переведены в unmanaged", unmanaged)
-
-	if err := reloadNetworkManager(); err != nil {
-		w.p.Warn("не удалось перезапустить NetworkManager: %v", err)
-		w.p.Info("  Конфиг подхватится при следующей перезагрузке.")
-	} else {
-		w.p.Info("  NetworkManager перезапущен, настройки применены.")
-	}
+	w.p.OK("NetworkManager: LAN-профиль закреплён без default route")
 	return nil
 }
 

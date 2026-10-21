@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"enter-box/internal/config"
+	"enter-box/internal/netcfg"
 	"enter-box/internal/parser"
 	"enter-box/internal/proxyapi"
 	"enter-box/internal/setup"
@@ -69,7 +71,7 @@ func usage() {
   check                       проверки окружения
   interfaces                  список сетевых интерфейсов
   run  -c <path>              запуск демона
-  proxy [status|list|test|switch|auto]   управление активным VPN-узлом
+  proxy [menu|status|list|test|switch|auto|reconnect] управление VPN
   wifi  <on|off|connect|scan> управление WiFi
   version                     версия
 
@@ -86,6 +88,8 @@ func usage() {
   enter-box proxy                         показать активный узел
   enter-box proxy list                    все узлы с задержками
   enter-box proxy test proxy-auto         прогнать все узлы сейчас
+  enter-box proxy menu                    выбрать сервер номером по SSH
+  enter-box proxy reconnect               переподключить VPN, сохранив LAN
   enter-box proxy switch provider/node3   прибить узел
   enter-box proxy auto                    вернуть автовыбор
   sudo enter-box wifi scan                скан сетей
@@ -161,6 +165,15 @@ func cmdRun(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Ждём готовности WAN (интерфейс поднят, есть IPv4 и default-маршрут),
+	// прежде чем загружать узлы и поднимать sing-box. При -dump не ждём.
+	if !*dump {
+		if err := netcfg.WaitWANReady(ctx, logger, cfg.WAN.Name, 3*time.Minute); err != nil {
+			logger.Error("wait WAN", "iface", cfg.WAN.Name, "err", err)
+			return 1
+		}
+	}
+
 	pool := parser.NewPool()
 	if err := pool.LoadFromConfig(ctx, cfg); err != nil {
 		logger.Error("load endpoints", "err", err)
@@ -188,11 +201,30 @@ func cmdRun(args []string) int {
 	}
 	if err := runner.Start(ctx); err != nil {
 		logger.Error("start", "err", err)
+		// При частичном запуске освобождаем DNS/DHCP, AWG и TUN перед выходом.
+		runner.Stop()
 		return 1
 	}
 
 	watcher := subs.New(logger, cfg, pool, runner)
 	go watcher.Run(ctx)
+	// SIGUSR1 переподключает только VPN; systemctl restart всей службы
+	// для этой операции не нужен и не сбрасывает клиентские DHCP-аренды.
+	reconnect := make(chan os.Signal, 1)
+	signal.Notify(reconnect, syscall.SIGUSR1)
+	defer signal.Stop(reconnect)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reconnect:
+				if err := runner.RestartVPN(ctx); err != nil {
+					logger.Warn("переподключение VPN не выполнено", "err", err)
+				}
+			}
+		}
+	}()
 
 	logger.Info("enter-box ready", "version", version)
 	<-ctx.Done()
@@ -210,6 +242,11 @@ func cmdProxy(args []string) int {
 		return proxyStatus(c)
 	}
 	switch args[0] {
+	case "menu", "manual":
+		// Нумерация и выбор используют один снимок списка до явного обновления.
+		return proxyMenu(c, os.Stdin, os.Stdout)
+	case "reconnect":
+		return proxyReconnect(os.Stdin, os.Stdout)
 	case "status", "st":
 		return proxyStatus(c)
 	case "list", "ls":
@@ -227,7 +264,12 @@ func cmdProxy(args []string) int {
 		}
 		return proxySwitch(c, args[1])
 	case "auto":
-		return proxySwitch(c, "proxy-auto")
+		if code := proxyAuto(c); code != 0 {
+			fmt.Fprintln(os.Stderr, "не удалось включить автоматический режим")
+			return code
+		}
+		fmt.Println("Автоматический режим включён; исправный текущий узел сохраняется")
+		return 0
 	}
 	fmt.Fprintln(os.Stderr, "неизвестная подкоманда. См. enter-box help")
 	return 2
@@ -240,10 +282,21 @@ func proxyStatus(c *proxyapi.Client) int {
 		fmt.Fprintln(os.Stderr, "подсказка: enter-box запущен? Проверьте: systemctl status enter-box")
 		return 1
 	}
-	auto, _ := c.AutoNode()
-	fmt.Printf("Активный узел:  %s\n", active)
-	if auto != "" && auto != active {
-		fmt.Printf("Auto (urltest): %s\n", auto)
+	current := active
+	if active == "proxy-auto" {
+		fmt.Println("Режим: автоматический (proxy-auto), смена узла только после отказа")
+		current, err = c.AutoNode()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "не удалось получить автоматический узел:", err)
+			return 1
+		}
+	} else {
+		fmt.Println("Режим: ручной, выбранный VPN-сервер закреплён")
+	}
+	fmt.Printf("Текущий выход: %s\n", current)
+	if current == "direct" {
+		// Аварийный direct теперь находится внутри auto-селектора.
+		fmt.Println("ВНИМАНИЕ: VPN не используется, прямой интернет через модем")
 	}
 	return 0
 }
@@ -258,15 +311,22 @@ func proxyList(c *proxyapi.Client) int {
 		fmt.Println("Узлов не найдено")
 		return 0
 	}
-	fmt.Printf("%-30s %-10s %-8s %s\n", "TAG", "TYPE", "ALIVE", "DELAY")
-	for _, n := range nodes {
-		fmt.Printf("%-30s %-10s %-8s %s\n", n.Tag, n.Type, n.Alive, n.Delay)
-	}
+	// История задержек может устареть: перед показом проверяем узлы заново.
+	printProxyTable(os.Stdout, probeProxyNodes(context.Background(), c, nodes))
 	return 0
 }
 
 func proxyTest(c *proxyapi.Client, tag string) int {
-	delay, err := c.TestDelay(tag, "", 0)
+	// Проверка группы означает свежую проверку всех реальных серверов.
+	if tag == "proxy-auto" {
+		nodes, err := c.Snapshot()
+		if err != nil { fmt.Fprintln(os.Stderr, err); return 1 }
+		nodes = probeProxyNodes(context.Background(), c, nodes)
+		printProxyTable(os.Stdout, nodes)
+		for _, node := range nodes { if node.Alive == "ok" { return 0 } }
+		return 1 // Успех команды test означает, что хотя бы один VPN действительно ответил.
+	}
+	delay, err := c.Probe(context.Background(), tag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", tag, err)
 		return 1

@@ -118,6 +118,13 @@ func (p *Pool) Offer(mac net.HardwareAddr) *Lease {
 	return nil
 }
 
+// Release удаляет аренду для MAC (обработка DHCPRELEASE).
+func (p *Pool) Release(mac net.HardwareAddr) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.leases, mac.String())
+}
+
 func cloneIP(ip net.IP) net.IP {
 	out := make(net.IP, len(ip))
 	copy(out, ip)

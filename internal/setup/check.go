@@ -64,15 +64,15 @@ func Preflight() []Check {
 
 	// Конфликты.
 	//
-	// NetworkManager больше НЕ конфликтует: wizard переведёт LAN-интерфейсы
-	// в unmanaged, а сам NM останется для WAN (DHCP) и Wi-Fi (nmcli).
+	// NetworkManager хранит постоянный LAN-профиль и продолжает обслуживать
+	// WAN/Wi-Fi; enter-box отвечает за DHCP/VPN, без гонки за LAN-адрес.
 	// Поэтому помечаем его как информацию, а не как проблему.
 	//
 	// systemd-networkd и dhcpcd — реальные конфликты: wizard их отключит.
 	if serviceState("NetworkManager") == "active" {
 		checks = append(checks, Check{
 			Name: "info:NetworkManager", OK: true, Critical: false,
-			Message: "NetworkManager активен (используется для WAN и Wi-Fi; wizard переведёт LAN в unmanaged)",
+			Message: "NetworkManager активен: LAN будет настроен постоянным manual-профилем, WAN и Wi-Fi остаются под NM",
 		})
 	}
 

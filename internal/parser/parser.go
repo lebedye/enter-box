@@ -12,8 +12,15 @@ func ParseLink(raw string) (*Endpoint, error) {
 		return ParseVLESS(raw)
 	case strings.HasPrefix(raw, "vmess://"):
 		return ParseVMess(raw)
+	case strings.HasPrefix(raw, "hysteria2://"), strings.HasPrefix(raw, "hy2://"):
+		return ParseHysteria2(raw)
 	case strings.HasPrefix(raw, "vpn://"):
 		return ParseVPN(raw)
 	}
-	return nil, fmt.Errorf("unsupported scheme: %.24s", raw)
+	// Не включаем исходную ссылку в ошибку: в ней могут находиться пароль и UUID.
+	scheme, _, _ := strings.Cut(raw, ":")
+	if len(scheme) > 24 || strings.ContainsAny(scheme, "@/?#") {
+		scheme = "unknown"
+	}
+	return nil, fmt.Errorf("unsupported scheme: %s", scheme)
 }
