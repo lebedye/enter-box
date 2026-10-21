@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-  # Ручной запуск из вкладки Actions (полезно для тестов)
   workflow_dispatch:
     inputs:
       tag:
@@ -12,32 +11,43 @@ on:
         required: true
 
 permissions:
-  contents: write   # нужно для создания Release
+  contents: write
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet and Test
+        run: |
+          go vet -tags with_clash_api,with_utls,with_quic ./...
+          go test -tags with_clash_api,with_utls,with_quic ./...
+
   build:
     name: Build ${{ matrix.suffix }}
+    needs: test
     runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Orange Pi (ARM64) — основная цель
           - goos: linux
             goarch: arm64
             suffix: linux-arm64
-          # ARMv7 — старые Pi / некоторые Orange Pi
           - goos: linux
             goarch: arm
             goarm: '7'
             suffix: linux-armv7
-          # ARMv6 — Raspberry Pi Zero и древние платы
           - goos: linux
             goarch: arm
             goarm: '6'
             suffix: linux-armv6
-          # x86_64 — для тестов на дев-машине
           - goos: linux
             goarch: amd64
             suffix: linux-amd64
@@ -73,11 +83,15 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           OUT="dist/enter-box-${{ matrix.suffix }}"
+          
+          # ВАЖНО: добавлены теги, иначе бинарник не соберет нужные протоколы
           go build \
+            -tags with_clash_api,with_utls,with_quic \
             -trimpath \
             -ldflags "-s -w -X main.version=${{ steps.ver.outputs.version }}" \
             -o "$OUT" \
             ./cmd/enter-box
+            
           ls -lh "$OUT"
           file "$OUT"
 
@@ -88,18 +102,16 @@ jobs:
           STAGE="dist/$NAME"
           BIN="dist/enter-box-${{ matrix.suffix }}"
 
-          # Бинарь обязателен — если его нет, дальше нет смысла.
           [ -f "$BIN" ] || { echo "binary $BIN not built"; exit 1; }
           mkdir -p "$STAGE"
           cp "$BIN" "$STAGE/enter-box"
 
-          # Всё остальное — по возможности. Чего нет — не повод падать.
-          [ -f enter-box.example.yaml ]           && cp enter-box.example.yaml           "$STAGE/"
+          # Копируем актуальные файлы. Если чего-то нет — пропускаем.
+          [ -f deploy/enter-box.router.yaml ]    && cp deploy/enter-box.router.yaml    "$STAGE/enter-box.example.yaml"
           [ -f deploy/systemd/enter-box.service ] && cp deploy/systemd/enter-box.service "$STAGE/"
-          [ -f deploy/nftables/enter-box.nft ]    && cp deploy/nftables/enter-box.nft    "$STAGE/"
           [ -f README.md ]                        && cp README.md                        "$STAGE/"
-          [ -f docs/USERDOC.md ]                  && cp docs/USERDOC.md                  "$STAGE/"
-          [ -f docs/SIMPLE-README.md ]            && cp docs/SIMPLE-README.md            "$STAGE/"
+          [ -f docs/INSTALL.md ]                  && cp docs/INSTALL.md                  "$STAGE/"
+          [ -f docs/OPERATIONS.md ]               && cp docs/OPERATIONS.md               "$STAGE/"
 
           tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
           (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
@@ -115,7 +127,6 @@ jobs:
             dist/*.tar.gz.sha256
           retention-days: 14
 
-  # Отдельная job — собрать всё в один релиз
   release:
     name: Publish release
     needs: build
@@ -160,7 +171,7 @@ jobs:
             ## enter-box ${{ steps.ver.outputs.version }}
 
             VPN-шлюз для Orange Pi и других Linux-устройств.
-            VLESS / VMess / AmneziaWG, RU → direct, всё остальное → VPN.
+            VLESS / VMess / AmneziaWG, RU -> direct, всё остальное -> VPN.
 
             ### Установка
 
